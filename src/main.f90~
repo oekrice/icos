@@ -1,0 +1,181 @@
+!*******************************************************************************
+PROGRAM main
+!*******************************************************************************
+! Main fortran file. Use this to initialise parameters, grid, produce/read in initial conditions and then run the code. Theoretically. Want to run with intel debuggers on, otherwise definitely not going to pick up on all the mistakes
+!*******************************************************************************
+    USE shared_data
+    USE mpi_tools
+    USE grid
+    USE import_export
+    USE ops
+
+    IMPLICIT NONE
+
+    !Import parameters from text file (saved out by python)
+    open(1,file= "parameters.txt")
+    read(1, *) parameters
+    close(1)
+
+
+    ! Read in parameters that have been saved out by 'run.py'
+    G = int(parameters(0))
+    rmax = parameters(1)
+    tmax = parameters(3)
+
+    eta = parameters(4)
+    nu0 = parameters(5)
+    eta0 = parameters(6)
+    voutfact = parameters(7)
+    shearfact = parameters(8)
+
+    cfl = parameters(9)
+    eps = parameters(10)
+
+    crot = int(parameters(11))  !Carrington rotation of initial condition, or index of initial condition if not using hmi data
+
+    ndiags = int(parameters(12))  !Number of diagnostic outputs (open flux etc.)
+    nplots = int(parameters(13))  !Number of full magnetic field saves (which could be rather large)
+
+    run_id = int(parameters(14))
+
+    shear_frame = int(parameters(16))
+
+    rsun = parameters(17)
+
+    !data_directory = "/extra/tmp/trcn27/icos_data/"  !For local machine
+    write (data_directory, "(A26,I1,A1)") "/nobackup/trcn27/icos_data/", run_id, "/"  !For hamilton
+
+
+    write (init_filename, "(A12,I1,A1,I1,A1,I4,A3)") "inits/pfield", G, "_", run_id, "_", crot, ".nc"
+    use_tweaked_pts = .true.
+    constant_friction = .true.
+
+    call start_mpi()  !Establish process position within the grid
+
+    if (proc_num == 0) print*, 'Number of processors', nprocs
+    if (proc_num == 0) print*, 'Output directory according to fortran: ', trim(data_directory)
+    if (proc_num == 0) print*, 'Initial condition filename = ', init_filename
+     !Import the parameters and set up the grid
+    call establish_grid()
+
+    if (proc_num == 0) print*, 'Grid established, G = ', G
+
+    call import_initial_condition()  !This loads in the initial potential field from the netcdf file. One process then integrates to find the vector potential, which is then distributed to the individual processes
+
+    call evolve()
+    call mpi_finalize(ierr)  !Let's MPI know that it's finished
+
+    contains
+
+    subroutine evolve()
+
+        implicit none
+
+        call allocate_variable_arrays()
+        call find_dt()  !Calculates the timestep. This function to be in ops
+        call make_vout_field()
+        call make_fric_field()
+
+        if (proc_num == 0) print*, 'Running code'
+
+        diag_num = 0; plot_num = 0
+        do step = 1, nt
+
+            if (mod(nt, 100) == 0) call average_edges()  !Takes care of any rounding errors. Quite slow so do not use every timestep.
+
+            !call afield_ghosts() !New function, populates the ghost points in the a field instead of doing it for b. May be treacherous
+
+            call calculate_magnetic()
+
+            call check_divfree_interior()  !Check everything is still divergence-free. Will terminate the code if not.
+
+            call bfield_ghosts_1()  !uses MPI
+            call bfield_bound()
+            call bfield_ghosts_2()   !This is the same as bfield_ghosts_1 but only transfers the cells at the top and bottom (those affected by bfield_bound)
+
+            call calculate_current()
+
+
+            call jfield_ghosts()  !Populates the horizontal ghost triangles for the current field. Do vertical current as well!
+            call j_to_edges()
+            call extend_jedges()
+
+
+            call b_to_edges()
+            call extend_bedges()
+
+            call calculate_friction()
+
+            call calculate_electric()
+
+            call add_diffusion()  !Adds diffusion using averaged current. Less accurate but more stable than directly adding the current to the electric field
+
+            call electric_integral()
+
+            call add_outflow()
+
+            if (seg_layer == 0) then  !Add boundary effects
+                call add_shearing()
+                call add_surface_diffusion()
+            end if
+
+            ! Output magnetic field for plotting
+            if ((step-1)*dt .ge. plot_num*(tmax/float(nplots-1))) then
+                call export_with_checks
+
+                !call reset_afield
+                plot_num = plot_num + 1
+            end if
+
+            ! Calculate and export diagnostics
+            if ((step-1)*dt .ge. diag_num*(tmax/float(ndiags-1))) then
+                call diagnostics
+                diag_num = diag_num + 1
+            end if
+            !call check_scaling()
+
+            !Actually perform the timestep
+
+            ar(0:nr +1,0:npts-1,seg_min:seg_max) = ar(0:nr +1,0:npts-1,seg_min:seg_max) - dt*er
+            ah(1:nr +1,0:2,0:ntri-1,seg_min:seg_max) = ah(1:nr +1,0:2,0:ntri-1,seg_min:seg_max) - &
+            dt*eh(1:nr +1,0:2,0:ntri-1,seg_min:seg_max)
+
+
+            call MPI_barrier(comm, ierr)
+
+        end do
+
+        !At the end, export one last time
+        call export_with_checks
+        !call diagnostics
+
+        if (proc_num == 0) print*, 'Code terminated sucessfully'
+
+    end subroutine evolve
+
+END PROGRAM main
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
