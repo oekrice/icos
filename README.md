@@ -1,0 +1,2 @@
+# icos
+Icosahedral Magnetofrictional Code
